@@ -1,0 +1,42 @@
+{
+	"schemaVersion": 1,
+	"id": "webdisplays",
+	"version": "${version}",
+	"name": "WebDisplays",
+	"description": "Adds in-game web browser screens powered by MCEF (Minecraft Chromium Embedded Framework)",
+	"authors": [
+		"LX",
+		"ds58",
+		"Mysticpasta1",
+		"montoyo",
+		"WaterPicker",
+		"LGiantLuigi4X"
+	],
+	"contact": {
+		"homepage": "https://github.com/CinemaMod/webdisplays",
+		"sources": "https://github.com/CinemaMod/webdisplays"
+	},
+	"license": "MIT",
+	"icon": "assets/webdisplays/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"net.montoyo.wd.WebDisplays"
+		],
+		"client": [
+			"net.montoyo.wd.client.ClientInit"
+		]
+	},
+	"mixins": [
+		"webdisplays.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.14.0",
+		"minecraft": "~1.20.1",
+		"java": ">=17",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"mcef": ">=2.1.0"
+	}
+}

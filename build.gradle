@@ -1,0 +1,117 @@
+plugins {
+	id 'fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+loom {
+}
+
+repositories {
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+// Custom remapping: Loom 1.5.8 remapJar is broken, use tiny-remapper directly
+configurations {
+    tinyRemapper
+}
+
+dependencies {
+    tinyRemapper "net.fabricmc:tiny-remapper:0.10.3"
+}
+
+def getLoomMappingsFile() {
+    // The mapping file is extracted as hash_to_mojang.tiny from the layered ZIP
+    def globalCache = file("${System.getProperty('user.home')}/.gradle/caches/fabric-loom/1.20.1/layered/hash_to_mojang.tiny")
+    if (globalCache.exists()) {
+        return globalCache
+    }
+    // Fall back: find any .tiny file in the layered directory
+    def layered = file("${System.getProperty('user.home')}/.gradle/caches/fabric-loom/1.20.1/layered")
+    if (layered.exists()) {
+        def files = fileTree(layered).include("**/*.tiny").files.sort { it.lastModified() }
+        if (!files.isEmpty()) return files.last()
+    }
+    throw new GradleException("Cannot find loom mappings file.")
+}
+
+task remapModJar(type: JavaExec) {
+    dependsOn jar
+    
+    def inputJar = file("${buildDir}/devlibs/${rootProject.name}-${version}-dev.jar")
+    def outputJar = file("${buildDir}/libs/${rootProject.name}-${version}.jar")
+    def mappingsFile = getLoomMappingsFile()
+    
+    // Find Minecraft merged jar from loom cache
+    def mcMergedJar = fileTree("${rootProject.projectDir}/.gradle/loom-cache").include("**/minecraft-merged*.jar").files.sort().last()
+    
+    inputs.file inputJar
+    inputs.file mappingsFile
+    if (mcMergedJar?.exists()) inputs.file mcMergedJar
+    outputs.file outputJar
+    
+    classpath = configurations.tinyRemapper
+    mainClass = 'net.fabricmc.tinyremapper.Main'
+    
+    args inputJar
+    args outputJar
+    args mappingsFile
+    args 'named'
+    args 'intermediary'
+    
+    if (mcMergedJar?.exists()) {
+        args mcMergedJar
+    }
+    
+    doFirst {
+        if (!inputJar.exists()) {
+            throw new GradleException("Input jar not found: ${inputJar}")
+        }
+        outputJar.parentFile.mkdirs()
+        logger.lifecycle("Remapping {} using {}...", inputJar.name, mappingsFile.name)
+    }
+}
+
+// Override the built-in remapJar to use our custom task
+remapJar.enabled = false
+build.dependsOn remapModJar
+assemble.dependsOn remapModJar
+
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+	repositories {
+	}
+}

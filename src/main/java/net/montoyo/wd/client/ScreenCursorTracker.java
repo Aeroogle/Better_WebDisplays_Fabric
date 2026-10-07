@@ -1,0 +1,282 @@
+package net.montoyo.wd.client;
+
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.phys.Vec3;
+import net.montoyo.wd.client.mcef.MCEFHelper;
+import net.montoyo.wd.entity.ScreenBlockEntity;
+import net.montoyo.wd.entity.ScreenData;
+import net.montoyo.wd.network.ScreenActionPayload;
+import net.montoyo.wd.utilities.data.BlockSide;
+import net.montoyo.wd.utilities.math.Vector2i;
+import org.joml.Vector3d;
+
+public class ScreenCursorTracker {
+
+    public static class CursorInfo {
+        public BlockPos pos;
+        public BlockSide side;
+        public double localX, localY, localZ;
+        public int pixelX, pixelY;
+        public ScreenBlockEntity blockEntity;
+        public ScreenData screenData;
+    }
+
+    private static CursorInfo currentCursor = null;
+    private static long lastMoveTime = 0;
+    private static long lastSyncTime = 0;
+    private static boolean wasAttackDown = false;
+    private static boolean cursorVisible = false;
+    private static boolean leftButtonPressed = false;
+    private static long lastRaycastTime = 0;
+    private static final long RAYCAST_INTERVAL_MS = 50; // 20 ticks/sec → reduce to ~20/sec effectively, but skip redundant calculations
+    private static final long MOUSE_MOVE_SYNC_INTERVAL_MS = 50; // throttle C2S mouse move sync to ~20 pkt/s per player
+    private static int lastPlayerChunkX = Integer.MIN_VALUE, lastPlayerChunkZ = Integer.MIN_VALUE;
+    private static int playerLookDirty = 0;
+    private static double lastYaw = Double.NaN, lastPitch = Double.NaN;
+
+    public static boolean isCursorVisible() {
+        return cursorVisible;
+    }
+
+    public static void toggleCursorVisible() {
+        cursorVisible = !cursorVisible;
+    }
+
+    public static CursorInfo getCurrentCursor() {
+        return currentCursor;
+    }
+
+    public static boolean isScreenFocused() {
+        return currentCursor != null && cursorVisible;
+    }
+
+    public static void update(Minecraft mc) {
+        if (mc.level == null || mc.player == null || !cursorVisible) {
+            if (currentCursor != null) {
+                if (leftButtonPressed) {
+                    releaseLeftButton();
+                }
+                sendMouseLeave(mc);
+            }
+            currentCursor = null;
+            return;
+        }
+
+        // Skip raycast if player hasn't rotated (major optimization)
+        float yaw = mc.player.getYRot();
+        float pitch = mc.player.getXRot();
+        if (yaw == lastYaw && pitch == lastPitch) {
+            // Only send mouse move if we have a current cursor (to keep hover state)
+            if (currentCursor != null) {
+                long now = System.currentTimeMillis();
+                if (now - lastMoveTime > 100) {
+                    lastMoveTime = now; // keep alive
+                }
+            }
+            return;
+        }
+        lastYaw = yaw;
+        lastPitch = pitch;
+
+        Vec3 origin = mc.player.getEyePosition(1.0f);
+        Vec3 look = mc.player.getViewVector(1.0f);
+
+        CursorInfo best = null;
+        double bestDist = Double.MAX_VALUE;
+
+        for (ScreenBlockEntity screen : ScreenBlockEntity.getClientScreens()) {
+            if (screen.getLevel() != mc.level) continue;
+
+            for (int i = 0; i < screen.screenCount(); i++) {
+                ScreenData data = screen.getScreen(i);
+                if (data == null || data.browser == null) continue;
+
+                BlockPos bp = screen.getBlockPos();
+                double bx = bp.getX(), by = bp.getY(), bz = bp.getZ();
+                float w = data.size.x, h = data.size.y;
+
+                Vector3d N = data.side.normal;
+                Vector3d R = data.side.right;
+                Vector3d U = data.side.up;
+
+                double cx, cy, cz;
+                switch (data.side) {
+                    case NORTH -> { cx = bx + w / 2; cy = by + h / 2; cz = bz; }
+                    case SOUTH -> { cx = bx + w / 2; cy = by + h / 2; cz = bz + 1; }
+                    case WEST ->  { cx = bx; cy = by + h / 2; cz = bz + w / 2; }
+                    case EAST ->  { cx = bx + 1; cy = by + h / 2; cz = bz + w / 2; }
+                    case BOTTOM ->{ cx = bx + w / 2; cy = by; cz = bz + h / 2; }
+                    case TOP ->   { cx = bx + w / 2; cy = by + 1; cz = bz + h / 2; }
+                    default -> { cx = bx; cy = by; cz = bz; }
+                }
+
+                double ox = origin.x, oy = origin.y, oz = origin.z;
+                double dx = look.x, dy = look.y, dz = look.z;
+
+                double nd = dx * N.x + dy * N.y + dz * N.z;
+                if (nd >= 0) continue;
+
+                double t = ((cx - ox) * N.x + (cy - oy) * N.y + (cz - oz) * N.z) / nd;
+                if (t <= 0) continue;
+
+                double px = ox + t * dx;
+                double py = oy + t * dy;
+                double pz = oz + t * dz;
+
+                double lu = (px - cx) * R.x + (py - cy) * R.y + (pz - cz) * R.z;
+                double lv = (px - cx) * U.x + (py - cy) * U.y + (pz - cz) * U.z;
+
+                if (Math.abs(lu) > w / 2 || Math.abs(lv) > h / 2) continue;
+
+                if (t < bestDist) {
+                    bestDist = t;
+
+                    double localX = px - bx;
+                    double localY = py - by;
+                    double localZ = pz - bz;
+
+                    if (best == null) best = new CursorInfo();
+                    best.pos = bp;
+                    best.side = data.side;
+                    best.localX = localX;
+                    best.localY = localY;
+                    best.localZ = localZ;
+                    best.blockEntity = screen;
+                    best.screenData = data;
+
+                    Vector2i pixelPos = new Vector2i();
+                    screen.hitToScreenCoords(data, localX, localY, localZ, pixelPos);
+                    best.pixelX = pixelPos.x;
+                    best.pixelY = pixelPos.y;
+                }
+            }
+        }
+
+        if (best != null) {
+            long now = System.currentTimeMillis();
+            if (currentCursor == null ||
+                !currentCursor.pos.equals(best.pos) ||
+                currentCursor.pixelX != best.pixelX ||
+                currentCursor.pixelY != best.pixelY) {
+                // Local browser update: keep responsive at ~16ms (Forge-style smooth tracking)
+                if (now - lastMoveTime > 16) {
+                    MCEFHelper.sendMouseMove(best.screenData.browser, best.pixelX, best.pixelY, false);
+                    lastMoveTime = now;
+                }
+                // C2S sync: throttle to ~50ms to reduce network load while keeping
+                // other players reasonably in sync (Forge ClickControl.ControlType.MOVE parity)
+                if (now - lastSyncTime > MOUSE_MOVE_SYNC_INTERVAL_MS) {
+                    if (ClientPlayNetworking.canSend(ScreenActionPayload.CHANNEL)) {
+                        ClientPlayNetworking.send(ScreenActionPayload.CHANNEL,
+                                ScreenActionPayload.encode(ScreenActionPayload.mouseMove(
+                                        best.pos, best.side.id, best.pixelX, best.pixelY)));
+                    }
+                    lastSyncTime = now;
+                }
+            }
+            currentCursor = best;
+        } else {
+            if (currentCursor != null) {
+                if (leftButtonPressed) {
+                    releaseLeftButton();
+                }
+                sendMouseLeave(mc);
+                currentCursor = null;
+            }
+        }
+    }
+
+    public static void handleLeftClick(Minecraft mc) {
+        if (mc.level == null || mc.player == null) return;
+        if (!cursorVisible) return;
+        if (currentCursor == null || currentCursor.screenData == null) return;
+
+        boolean isDown = mc.options.keyAttack.isDown();
+
+        if (isDown && !leftButtonPressed) {
+            // Mouse button just pressed down
+            leftButtonPressed = true;
+            long now = System.currentTimeMillis();
+            int clickCount = (now - currentCursor.screenData.lastClickTime < 500) ? 2 : 1;
+            currentCursor.screenData.lastClickTime = now;
+            MCEFHelper.sendMouseMove(currentCursor.screenData.browser, currentCursor.pixelX, currentCursor.pixelY, false);
+            MCEFHelper.sendMouseClick(currentCursor.screenData.browser, currentCursor.pixelX, currentCursor.pixelY, 0, false, clickCount);
+            // C2S sync: broadcast mouse-down to other tracking players
+            // (Forge ClickControl.ControlType.DOWN parity — sendMouseMove then sendMousePress)
+            if (ClientPlayNetworking.canSend(ScreenActionPayload.CHANNEL)) {
+                ClientPlayNetworking.send(ScreenActionPayload.CHANNEL,
+                        ScreenActionPayload.encode(ScreenActionPayload.mouseDown(
+                                currentCursor.pos, currentCursor.side.id,
+                                currentCursor.pixelX, currentCursor.pixelY, 0, clickCount)));
+            }
+        } else if (!isDown && leftButtonPressed) {
+            // Mouse button just released
+            releaseLeftButton();
+        }
+
+        wasAttackDown = isDown || mc.player.isSpectator();
+    }
+
+    private static void releaseLeftButton() {
+        if (leftButtonPressed && currentCursor != null && currentCursor.screenData != null) {
+            MCEFHelper.sendMouseClick(currentCursor.screenData.browser, currentCursor.pixelX, currentCursor.pixelY, 0, true, 1);
+            // C2S sync: broadcast mouse-up to other tracking players
+            // (Forge ClickControl.ControlType.UP parity — sendMouseRelease)
+            if (ClientPlayNetworking.canSend(ScreenActionPayload.CHANNEL)) {
+                ClientPlayNetworking.send(ScreenActionPayload.CHANNEL,
+                        ScreenActionPayload.encode(ScreenActionPayload.mouseUp(
+                                currentCursor.pos, currentCursor.side.id,
+                                currentCursor.pixelX, currentCursor.pixelY, 0)));
+            }
+        }
+        leftButtonPressed = false;
+    }
+
+    public static void handleScroll(double delta) {
+        if (!cursorVisible) return;
+        if (currentCursor == null || currentCursor.screenData == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return;
+
+        if (mc.player.isShiftKeyDown()) {
+            double amount = -delta * 4;
+            int modifiers = 0;
+            MCEFHelper.sendMouseWheel(currentCursor.screenData.browser, currentCursor.pixelX, currentCursor.pixelY, amount, modifiers);
+            // C2S sync: broadcast mouse-wheel to other tracking players
+            if (ClientPlayNetworking.canSend(ScreenActionPayload.CHANNEL)) {
+                ClientPlayNetworking.send(ScreenActionPayload.CHANNEL,
+                        ScreenActionPayload.encode(ScreenActionPayload.mouseWheel(
+                                currentCursor.pos, currentCursor.side.id,
+                                currentCursor.pixelX, currentCursor.pixelY, amount, modifiers)));
+            }
+        } else if (net.minecraft.client.gui.screens.Screen.hasControlDown()) {
+            // Ctrl + scroll: zoom browser page (client-local only — page zoom is a
+            // client-side preference and not synchronized, matching browser behavior)
+            ScreenData data = currentCursor.screenData;
+            double step = 0.1;
+            if (delta > 0) {
+                data.zoomLevel = Math.min(5.0, data.zoomLevel + step);
+            } else {
+                data.zoomLevel = Math.max(0.2, data.zoomLevel - step);
+            }
+            // Inject zoom via JavaScript
+            int zoomPercent = (int) (data.zoomLevel * 100);
+            String js = "document.body.style.zoom='" + zoomPercent + "%'";
+            MCEFHelper.injectJavascript(data.browser, js);
+        }
+    }
+
+    public static void clear() {
+        if (leftButtonPressed) {
+            releaseLeftButton();
+        }
+        currentCursor = null;
+    }
+
+    private static void sendMouseLeave(Minecraft mc) {
+        if (currentCursor == null || currentCursor.screenData == null) return;
+        MCEFHelper.sendMouseMove(currentCursor.screenData.browser, -1, -1, true);
+    }
+}
